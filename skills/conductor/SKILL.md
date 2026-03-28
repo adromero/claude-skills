@@ -46,7 +46,7 @@ Before creating stage specs, generate/update the code map for the project. This 
 1. Determine the project root directory (the directory containing the plan file, or the working directory if more appropriate).
 2. Run the code map generator:
    ```
-   $CODEMAP_CMD <project_path>
+   bash /home/alfonso/Projects/code-map-generator/run.sh <project_path>
    ```
    This generates or updates the code map. Output goes to stdout (JSON), logs/errors to stderr.
 3. If the code map generator fails (non-zero exit, missing tool, etc.), log a warning and proceed without code map data. Do NOT halt the build.
@@ -65,7 +65,7 @@ For each extracted stage, create a spec file at `.claude/conductor/stages/{id}.m
 **Populating "Existing Context" (unless `--no-codemap`)**: For each stage, run auto-context selection to identify files relevant to that stage's work:
 
 ```
-$CODEMAP_CMD <project_path> --select "<stage title and deliverables summary>" --json
+bash /home/alfonso/Projects/code-map-generator/run.sh <project_path> --select "<stage title and deliverables summary>" --json
 ```
 
 Parse the JSON output and include the relevant files table and summary in the stage spec's "Existing Context" section (see `references/protocols.md` for the template). If the auto-context command fails for a stage, log a warning and create the spec without the "Existing Context" section.
@@ -101,13 +101,66 @@ A stage is READY when:
 - All stages in its `dependencies` list have status `complete`
 - It is not in the `--skip` list
 
+### Red Team Review
+
+Before spawning a worker, each READY stage goes through a red team review:
+
+1. Update `progress.json`: set stage status to `red-teaming`
+2. Read the stage spec from `.claude/conductor/stages/{id}.md`
+3. Gather context from completed dependency stages (files created, notes)
+4. Spawn a `red-team` reviewer via the Task tool:
+   - `subagent_type`: `"general-purpose"`
+   - `model`: `"sonnet"`
+   - `max_turns`: `10`
+   - Prompt: use the Red Team Prompt Template from `references/protocols.md`
+
+5. Process the red team result:
+   - **RED_TEAM: PASS** → proceed to Spawning Workers (set status to `running`)
+   - **RED_TEAM: FLAG** → set status to `flagged`, store issues in `red_team_issues` field of the stage in `progress.json`. Then escalate to the **Arbiter** (see below).
+
+### Arbiter Resolution
+
+When a stage is flagged, spawn an Opus arbiter agent to decide whether the issues can be resolved without human input:
+
+1. Spawn an `arbiter` via the Task tool:
+   - `subagent_type`: `"general-purpose"`
+   - `model`: `"opus"`
+   - `max_turns`: `15`
+   - Prompt: use the Arbiter Prompt Template from `references/protocols.md`
+   - Provide: the stage spec, the red team issues, AND the original plan file (so the arbiter can judge platform-level intent)
+
+2. Process the arbiter result:
+   - **ARBITER: SYNTHESIZE** → the arbiter has produced a revised stage spec. Write the updated spec to `.claude/conductor/stages/{id}.md`, clear `red_team_issues`, reset status to `pending` so the stage re-enters the red team queue with the revised spec. Log:
+     ```
+     [Conductor] Stage {id} flagged → arbiter synthesized revision → re-queued
+     ```
+   - **ARBITER: PROCEED** → the arbiter judged the flags as non-blocking. Set status to `running`, continue to Spawning Workers. Log:
+     ```
+     [Conductor] Stage {id} flagged → arbiter approved proceeding
+     ```
+   - **ARBITER: ESCALATE** → the arbiter could not find a workable synthesis, OR the issue would fundamentally change the platform's intent from the original plan. Surface to user:
+     ```
+     [Conductor] ESCALATION — Stage {id}: {title}
+     Red team issues:
+     - {issue 1}
+     - {issue 2}
+     Arbiter assessment: {arbiter's reasoning}
+     Action needed: (p)roceed anyway, (r)evise the stage spec, or (s)kip this stage?
+     ```
+     - User chooses proceed → set status to `running`
+     - User chooses revise → keep status `flagged`; after user edits the spec, reset to `pending`
+     - User chooses skip → set status to `skipped`
+   - While waiting for user input on an escalated stage, continue dispatching other independent stages.
+
+The red team review and arbiter resolution count toward the `max_workers` concurrency cap (a stage in `red-teaming` or `flagged` occupies one slot).
+
 ### Spawning Workers
 
-For each READY stage (up to `max_workers` concurrent):
+For each stage that passed red team review (status transitioned to `running`):
 
 1. Read the stage spec from `.claude/conductor/stages/{id}.md`
 2. Gather context from completed dependency stages (files created, notes)
-3. Update `progress.json`: set stage status to `running`, record `started_at`
+3. Update `progress.json`: record `started_at` (status is already `running`)
 4. Spawn a `build-worker` via the Task tool:
    - `subagent_type`: `"general-purpose"`
    - `max_turns`: `60`
@@ -187,7 +240,7 @@ When a worker Task returns:
      1. Collect `files_created` and `files_modified` from the completed stage's worker result
      2. If there are any files to update, run:
         ```
-        $CODEMAP_CMD <project_path> --update-files file1.py file2.py ...
+        bash /home/alfonso/Projects/code-map-generator/run.sh <project_path> --update-files file1.py file2.py ...
         ```
         passing all created/modified files as arguments.
      3. This re-summarizes only the changed files, keeping the code map current for subsequent workers. The code-map-generator's built-in file locking ensures concurrent stage completions don't corrupt the cache.
@@ -215,12 +268,13 @@ After each stage transition, show a status table:
 ```
 [Conductor] Stage 1a → complete (42s)
 
-Stage | Title                        | Status     | Time
-------|------------------------------|------------|------
-0     | Setup                        | complete   | 1m12s
-1a    | Core Module                  | complete   | 42s
-1b    | Secondary Module             | running    | ...
-1c    | Integration                  | pending    | -
+Stage | Title                        | Status       | Time
+------|------------------------------|-------------|------
+0     | Setup                        | complete     | 1m12s
+1a    | Core Module                  | complete     | 42s
+1b    | Secondary Module             | running      | ...
+1c    | Integration                  | red-teaming  | ...
+1d    | Wiring                       | pending      | -
 ...
 ```
 
@@ -275,6 +329,7 @@ You are a CONTINUATION CONDUCTOR. A previous conductor hit its stage processing 
 3. Set stages_processed = 0
 4. Resume the dispatch loop:
    - Find READY stages (pending + all deps complete)
+   - Run red team review for each READY stage before spawning workers (see Red Team Prompt Template in protocols.md)
    - Spawn build-worker Tasks (max_turns: 60) per the worker prompt template in protocols.md
    - Process results, spawn build-verifier Tasks (model: haiku, max_turns: 20)
    - Update progress.json after each stage
@@ -298,4 +353,6 @@ On `--resume`:
 1. Read `progress.json`
 2. Any stage in `running` status with no recent log activity (>5 min) → reset to `pending`
 3. Any stage in `verifying` → re-run verification
-4. Continue dispatch loop from current state
+4. Any stage in `red-teaming` → reset to `pending` (red team agent was interrupted)
+5. Any stage in `flagged` → re-run arbiter resolution (the previous arbiter was interrupted)
+6. Continue dispatch loop from current state
